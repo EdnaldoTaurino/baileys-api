@@ -7,6 +7,7 @@ import {
   type SignalDataTypeMap,
 } from "@whiskeysockets/baileys";
 import redis from "@/lib/redis";
+import logger from "@/lib/logger";
 
 const redisKeyPrefix = "@baileys-api:connections";
 
@@ -20,15 +21,22 @@ export async function useRedisAuthState(
 }> {
   const createKey = (key: string) => `${redisKeyPrefix}:${id}:${key}`;
 
-  const writeData = (key: string, field: string, data: unknown) =>
-    redis.hSet(
+  const writeData = async (key: string, field: string, data: unknown) => {
+    logger.debug(
+      `[redisAuthState] Saving data: key=${createKey(key)}, field=${field}, data=${JSON.stringify(data)}`
+    );
+    return redis.hSet(
       createKey(key),
       field,
       JSON.stringify(data, BufferJSON.replacer),
     );
+  };
 
   const readData = async (key: string, field: string) => {
     const data = await redis.hGet(createKey(key), field);
+    logger.debug(
+      `[redisAuthState] Loading data: key=${createKey(key)}, field=${field}, found=${!!data}`
+    );
     return data ? JSON.parse(data, BufferJSON.reviver) : null;
   };
 
@@ -79,6 +87,9 @@ export async function useRedisAuthState(
           await multi.execAsPipeline();
         },
         clear: async () => {
+          logger.debug(
+            `[redisAuthState] Deleting session: key=${createKey("authState")}`
+          );
           await redis.del(createKey("authState"));
         },
       },

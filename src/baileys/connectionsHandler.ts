@@ -15,6 +15,7 @@ import type {
   SendReceiptsOptions,
 } from "@/baileys/types";
 import logger from "@/lib/logger";
+import redis from "@/lib/redis";
 
 export class BaileysConnectionsHandler {
   private connections: Record<string, BaileysConnection> = {};
@@ -48,21 +49,37 @@ export class BaileysConnectionsHandler {
   }
 
   async connect(phoneNumber: string, options: BaileysConnectionOptions) {
-    if (this.connections[phoneNumber]) {
-      // NOTE: This triggers a `connection.update` event.
-      await this.connections[phoneNumber].sendPresenceUpdate("available");
-      return;
+    // Lock de exclusividade no Redis para evitar múltiplas instâncias
+    const lockKey = `@baileys-api:lock:${phoneNumber}`;
+    const lockValue = Date.now().toString();
+    const acquired = await redis.set(lockKey, lockValue, { NX: true, EX: 60 });
+    if (!acquired) {
+      logger.error(`[BaileysConnectionsHandler] Já existe uma instância conectada para o número ${phoneNumber}`);
+      throw new Error("Já existe uma instância conectada para esse número!");
     }
 
-    const connection = new BaileysConnection(phoneNumber, {
-      ...options,
-      onConnectionClose: () => {
-        delete this.connections[phoneNumber];
-        options.onConnectionClose?.();
-      },
-    });
-    await connection.connect();
-    this.connections[phoneNumber] = connection;
+    try {
+      if (this.connections[phoneNumber]) {
+        // NOTE: This triggers a `connection.update` event.
+        await this.connections[phoneNumber].sendPresenceUpdate("available");
+        return;
+      }
+
+      const connection = new BaileysConnection(phoneNumber, {
+        ...options,
+        onConnectionClose: async () => {
+          delete this.connections[phoneNumber];
+          await redis.del(lockKey);
+          options.onConnectionClose?.();
+        },
+      });
+      await connection.connect();
+      this.connections[phoneNumber] = connection;
+    } catch (err) {
+      // Libera o lock em caso de erro
+      await redis.del(lockKey);
+      throw err;
+    }
   }
 
   private getConnection(phoneNumber: string) {
