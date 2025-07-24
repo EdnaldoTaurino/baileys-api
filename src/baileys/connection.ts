@@ -64,7 +64,6 @@ export class BaileysConnection {
   private socket: ReturnType<typeof makeWASocket> | null;
   private clearAuthState: AuthenticationState["keys"]["clear"] | null;
   private clearOnlinePresenceTimeout: NodeJS.Timer | null = null;
-  private reconnectCount = 0;
 
   constructor(phoneNumber: string, options: BaileysConnectionOptions) {
     this.phoneNumber = phoneNumber;
@@ -99,17 +98,26 @@ export class BaileysConnection {
       ttl: config.keyStore.lruCacheTtl,
     });
 
-    this.socket = makeWASocket({
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger, cache),
-      },
-      markOnlineOnConnect: false,
-      logger: baileysLogger,
-      browser: Browsers.windows(this.clientName),
-      syncFullHistory: this.syncFullHistory,
-      shouldIgnoreJid,
-    });
+    try {
+      this.socket = makeWASocket({
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, logger, cache),
+        },
+        markOnlineOnConnect: false,
+        logger: baileysLogger,
+        browser: Browsers.windows(this.clientName),
+        syncFullHistory: this.syncFullHistory,
+        shouldIgnoreJid,
+      });
+    } catch (error) {
+      logger.error(
+        "[%s] [BaileysConnection.connect] Failed to create socket: %s",
+        this.phoneNumber,
+        errorToString(error),
+      );
+      return;
+    }
 
     this.socket.ev.on("creds.update", saveCreds);
     this.socket.ev.on("connection.update", (event) =>
@@ -133,7 +141,6 @@ export class BaileysConnection {
     await this.clearAuthState?.();
     this.clearAuthState = null;
     this.socket = null;
-    this.reconnectCount = 0;
     this.onConnectionClose?.();
   }
 
@@ -162,17 +169,16 @@ export class BaileysConnection {
     let waveformProxy: Buffer | null = null;
     try {
       if ("audio" in messageContent && Buffer.isBuffer(messageContent.audio)) {
+        const originalAudio = messageContent.audio;
         // NOTE: Sent audio is always mp3.
         // Due to limitations in internal Baileys logic used to generate waveform, we use a wav proxy.
         [messageContent.audio, waveformProxy] = await Promise.all([
           preprocessAudio(
-            messageContent.audio,
+            originalAudio,
             // NOTE: Use low quality mp3 for ptt messages for more realistic quality.
             messageContent.ptt ? "mp3-low" : "mp3-high",
           ),
-          messageContent.ptt
-            ? preprocessAudio(messageContent.audio, "wav")
-            : null,
+          messageContent.ptt ? preprocessAudio(originalAudio, "wav") : null,
         ]);
         messageContent.mimetype = "audio/mpeg";
       }
@@ -305,6 +311,7 @@ export class BaileysConnection {
           lastDisconnect,
         );
         this.handleReconnecting();
+        // NOTE: We don't call `this.close()` here because we want to keep the auth state.
         this.socket = null;
         this.connect();
         return;
@@ -401,12 +408,6 @@ export class BaileysConnection {
   }
 
   private handleReconnecting() {
-    this.reconnectCount += 1;
-    if (this.reconnectCount > 10) {
-      this.close();
-      return;
-    }
-
     this.sendToWebhook({
       event: "connection.update",
       data: { connection: "reconnecting" as WAConnectionState },
